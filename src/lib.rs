@@ -18,12 +18,12 @@ impl Default for Lock {
 #[repr(C)]
 pub struct Storage<'a, T: 'a> {
     size: usize,
-    data: &'a mut [T],
-    locks: &'a mut [Lock],
+    data: &'a [T],
+    locks: &'a [Lock],
 }
 
 impl<'a, T> Storage<'a, T> {
-    pub fn new<const SIZE: usize>(data: &'a mut [T; SIZE], locks: &'a mut [Lock; SIZE]) -> Self {
+    pub fn new<const SIZE: usize>(data: &'a [T; SIZE], locks: &'a [Lock; SIZE]) -> Self {
         Self {
             size: SIZE,
             data,
