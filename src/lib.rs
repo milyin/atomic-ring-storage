@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, AtomicUsize, Ordering},
 };
 
 #[repr(C)]
@@ -96,6 +96,7 @@ impl Default for ItemHdr {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Token {
     // current position in the ring buffer is defined as id % size
     id: usize,
@@ -124,9 +125,9 @@ impl<'a, T> Storage<'a, T> {
         self.header.size
     }
 
-    pub fn put(&self, f: impl FnOnce(&mut T) -> bool) -> Option<Token> {
+    pub fn put(&self, f: impl FnOnce(&mut T)) -> Option<Token> {
         // try all items in the ring buffer starting from pos, wrapping around the end and finishing at pos-1
-        for i in 0..self.header.size {
+        for _ in 0..self.header.size {
             let id = self.header.next_id.fetch_add(1, Ordering::Relaxed);
             let pos = id % self.header.size;
             let hdr = &self.item_hdrs[pos];
@@ -161,6 +162,9 @@ impl<'a, T> Storage<'a, T> {
         let pos = token.id % self.header.size;
         let hdr = &self.item_hdrs[pos];
         let id = hdr.id.load(Ordering::Acquire);
+        if token.id != id {
+            return None;
+        }
         hdr.lock
             .read(|| hdr.refcount.fetch_add(1, Ordering::Release) + 1)
     }
@@ -169,18 +173,12 @@ impl<'a, T> Storage<'a, T> {
         let pos = token.id % self.header.size;
         let hdr = &self.item_hdrs[pos];
         let id = hdr.id.load(Ordering::Acquire);
+        if token.id != id {
+            return None;
+        }
         hdr.lock
             .read(|| hdr.refcount.fetch_sub(1, Ordering::Release) - 1)
     }
-}
-
-#[test]
-fn test_init_storage() {
-    let header = StorageHdr::new(10);
-    let items = [(); 10].map(|_| UnsafeCell::new(0));
-    let item_hdrs = [(); 10].map(|_| ItemHdr::default());
-    let storage = Storage::new(&header, &items, &item_hdrs);
-    assert_eq!(storage.size(), 10);
 }
 
 #[test]
@@ -200,4 +198,35 @@ fn test_lock_api() {
         Some(())
     );
     assert_eq!(lock.rwlock.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_storage() {
+    let header = StorageHdr::new(10);
+    let items = [(); 10].map(|_| UnsafeCell::new(0));
+    let item_hdrs = [(); 10].map(|_| ItemHdr::default());
+    let storage = Storage::new(&header, &items, &item_hdrs);
+    assert_eq!(storage.size(), 10);
+
+    // Fill all the storage
+    let mut tokens = Vec::new();
+    for i in 0..10 {
+        let token = storage.put(|item| {
+            *item = i;
+        });
+        assert!(token.is_some());
+        tokens.push(token.unwrap());
+    }
+
+    // Try to put one more item
+    let token = storage.put(|item| {
+        *item = 10;
+    });
+    assert!(token.is_none());
+
+    // Read all the items
+    for (i, token) in tokens.iter().enumerate() {
+        let value = storage.get(*token, |item| *item);
+        assert_eq!(value, Some(i));
+    }
 }
