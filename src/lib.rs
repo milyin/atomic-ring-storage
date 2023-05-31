@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI32, Ordering, AtomicU32};
+use std::{sync::atomic::{AtomicI32, Ordering, AtomicU32, AtomicUsize}, cell::UnsafeCell};
 
 #[repr(C)]
 pub struct Lock {
@@ -88,16 +88,15 @@ impl Lock {
 
 #[repr(C)]
 pub struct StorageHdr {
-    size: u32,
-    // position to allocate next element
-    pos: AtomicU32,
+    size: usize,
+    next_id: AtomicUsize,
 }
 
 impl StorageHdr {
-    pub fn new(size: u32) -> Self {
+    pub fn new(size: usize) -> Self {
         Self {
             size,
-            pos: AtomicU32::new(0),
+            next_id: AtomicUsize::new(0),
         }
     }
 }
@@ -107,7 +106,7 @@ impl StorageHdr {
 pub struct ItemHdr {
     lock: Lock,
     refcount: AtomicU32,
-    id: u64,
+    id: usize,
 }
 
 impl Default for ItemHdr {
@@ -121,33 +120,66 @@ impl Default for ItemHdr {
 }
 
 #[repr(C)]
+pub struct Token {
+    // current position in the ring buffer is defined as id % size
+    id: usize,
+}
+
+#[repr(C)]
 pub struct Storage<'a, T: 'a> {
     header: &'a StorageHdr,
-    items: &'a [T],
+    items: &'a [UnsafeCell<T>],
     item_hdrs: &'a [ItemHdr],
 }
 
 impl<'a, T> Storage<'a, T> {
     pub fn new(header: &'a StorageHdr,
-        items: &'a [T], item_hdrs: &'a [ItemHdr]) -> Self {
+        items: &'a [UnsafeCell<T>], item_hdrs: &'a [ItemHdr]) -> Self {
         Self {
             header,
             items,
             item_hdrs,
         }
     }
-    pub fn len(&self) -> usize {
-        self.header.size as usize
+    pub fn size(&self) -> usize {
+        self.header.size
+    }
+
+    pub fn put(&self, f: impl FnOnce(&mut T) -> bool ) -> Option<Token> {
+        let id_start = self.header.next_id.fetch_add(1, Ordering::Relaxed);
+        // try all items in the ring buffer starting from pos, wrapping around the end and finishing at pos-1
+        for i in 0..self.header.size {
+            let id = id_start + i;
+            let pos = (id_start + i) % self.header.size;
+            let hdr = &self.item_hdrs[pos];
+            if let Some(item) = hdr.lock.create(|| {
+                Some(unsafe { &mut *self.items[pos].get() })
+            }) {
+                // Token is not given to anyone yet so it's safe to access the data outside of the write lock
+                f(item);
+                return Some(Token { id});
+            }
+        }
+        // no free slots
+        None
+    }
+
+    pub fn get<R>(&self, token: Token, f: impl FnOnce(&T)-> R) -> Option<R> {
+        let pos = token.id % self.header.size;
+        let hdr = &self.item_hdrs[pos];
+        hdr.lock.read(|| {
+            f(unsafe { &*self.items[pos].get() })
+        })
     }
 }
 
 #[test]
 fn test_init_storage() {
     let header = StorageHdr::new(10);
-    let items = [0; 10];
+    let items = [(); 10] .map(|_| UnsafeCell::new(0));
     let item_hdrs = [(); 10].map(|_| ItemHdr::default());
     let storage = Storage::new(&header, &items, &item_hdrs);
-    assert_eq!(storage.len(), 10);
+    assert_eq!(storage.size(), 10);
 }
 
 #[test]
