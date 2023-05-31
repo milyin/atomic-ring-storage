@@ -2,9 +2,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 #[repr(C)]
 pub struct Lock {
-    // refcount == -1 means write lock
-    // refcount == 0 means protected data is not in use and can be owerwritten at any moment
-    // refcount > 0 means protected data exists and can be read. To safely read it refcount must be incremented first and then decremented when read is finished
+    // refcount == -1 means write lock, no operation is allowed
+    // refcount == 0 means protected data is empty, only 'create' operation is allowed
+    // refcount == 1 means protected data exists and not in use, 'update' and 'read' operations are allowed
+    // refcount > 1 means protected data exists and is being read, only 'read' operation is allowed
     refcount: AtomicI32,
 }
 
