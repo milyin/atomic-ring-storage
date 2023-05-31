@@ -229,4 +229,35 @@ fn test_storage() {
         let value = storage.get(*token, |item| *item);
         assert_eq!(value, Some(i));
     }
+
+    // Decreade refcount for first half of the items
+    for token in &tokens[0..5] {
+        let refcount = storage.decref(*token);
+        assert_eq!(refcount, Some(0));
+    }
+
+    // Fill the storage again
+    for i in 0..5 {
+        let token = storage.put(|item| {
+            *item = i + 10;
+        });
+        assert!(token.is_some());
+        tokens.push(token.unwrap());
+    }
+
+    // Try to put one more item
+    let token = storage.put(|item| {
+        *item = 10;
+    });
+    assert!(token.is_none());
+
+    // Read all the items. First 5 items expected to be None
+    for (i, token) in tokens.iter().enumerate() {
+        let value = storage.get(*token, |item| *item);
+        if i < 5 {
+            assert_eq!(value, None);
+        } else {
+            assert_eq!(value, Some(i));
+        }
+    }
 }
