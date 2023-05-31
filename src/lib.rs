@@ -17,14 +17,19 @@ impl Default for Lock {
 }
 
 impl Lock {
-    // Tries to acquire a write lock.
-    // If reference count is positive or another writer is active (refcount == -1), returns None.
-    // Otherwirs acquires the lock, calls write function f, sets reference count to 1 if f returns Some, and returns f's result.
-    pub fn write<R>(&self, f: impl FnOnce() -> Option<R>) -> Option<R> {
+    // Tries to acquire a write lock on empty data (refcount == 0).
+    // If data is not empty (refcount > 0) or another writer is active (refcount == -1), returns None.
+    // If data is empty (refcount == 0):
+    // - acquires the write lock (set refcount to -1)
+    // - calls write function f
+    //   - sets reference count to 1 if f returns Some
+    //   - sets reference count to 0 if f returns None
+    // - returns f's result.
+    pub fn create<R>(&self, f: impl FnOnce() -> Option<R>) -> Option<R> {
         if self
             .refcount
             .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
-            == Ok(0)
+            .is_ok()
         {
             let r = f();
             self.refcount
@@ -34,7 +39,29 @@ impl Lock {
             None
         }
     }
-    // Tries to acquire a read lock.
+    // Tries to acquire a write lock on non-empty data (refcount == 1).
+    // If data is empty (refcount == 0) or another writer is active (refcount == -1), or data is being read (refcount > 1) returns None.
+    // IF data is not empty and not being read (refcount == 1):
+    // - acquires the write lock (set refcount to -1)
+    // - calls update function f
+    //   - sets reference count to 1 if f returns Some
+    //   - sets reference count to 0 if f returns None
+    // - returns f's result.
+    pub fn update<R>(&self, f: impl FnOnce() -> Option<R>) -> Option<R> {
+        if self
+            .refcount
+            .compare_exchange_weak(1, -1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            let r = f();
+            self.refcount
+                .store(if r.is_some() { 1 } else { 0 }, Ordering::Release);
+            r
+        } else {
+            None
+        }
+    }
+    // Tries to acquire a read lock on non-empty data (refcount > 0).
     // If writer is active (refcount == -1) or there is no data (refcount == 0), returns None.
     // Otherwise increments reference count, calls read function f, decrements reference count and returns Some with f's result.
     pub fn read<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
@@ -54,12 +81,6 @@ impl Lock {
         let r = f();
         self.refcount.fetch_sub(1, Ordering::Release);
         Some(r)
-    }
-    // Revmoes the data if reference count is 1, i.e. the data exists and not readed or written at the moment.
-    pub fn remove(&self) -> bool {
-        self.refcount
-            .compare_exchange_weak(1, 0, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
     }
 }
 
