@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering, AtomicU32};
 
 #[repr(C)]
 pub struct Lock {
@@ -85,29 +85,69 @@ impl Lock {
     }
 }
 
+
+#[repr(C)]
+pub struct StorageHdr {
+    size: u32,
+    // position to allocate next element
+    pos: AtomicU32,
+}
+
+impl StorageHdr {
+    pub fn new(size: u32) -> Self {
+        Self {
+            size,
+            pos: AtomicU32::new(0),
+        }
+    }
+}
+
+
+#[repr(C)]
+pub struct ItemHdr {
+    lock: Lock,
+    refcount: AtomicU32,
+    id: u64,
+}
+
+impl Default for ItemHdr {
+    fn default() -> Self {
+        Self {
+            lock: Lock::default(),
+            refcount: AtomicU32::new(0),
+            id: 0,
+        }
+    }
+}
+
 #[repr(C)]
 pub struct Storage<'a, T: 'a> {
-    size: usize,
-    data: &'a [T],
-    locks: &'a [Lock],
+    header: &'a StorageHdr,
+    items: &'a [T],
+    item_hdrs: &'a [ItemHdr],
 }
 
 impl<'a, T> Storage<'a, T> {
-    pub fn new<const SIZE: usize>(data: &'a [T; SIZE], locks: &'a [Lock; SIZE]) -> Self {
+    pub fn new(header: &'a StorageHdr,
+        items: &'a [T], item_hdrs: &'a [ItemHdr]) -> Self {
         Self {
-            size: SIZE,
-            data,
-            locks,
+            header,
+            items,
+            item_hdrs,
         }
+    }
+    pub fn len(&self) -> usize {
+        self.header.size as usize
     }
 }
 
 #[test]
 fn test_init_storage() {
-    let mut data = [0; 10];
-    let mut locks = [(); 10].map(|_| Lock::default());
-    let storage = Storage::new(&mut data, &mut locks);
-    assert_eq!(storage.size, 10);
+    let header = StorageHdr::new(10);
+    let items = [0; 10];
+    let item_hdrs = [(); 10].map(|_| ItemHdr::default());
+    let storage = Storage::new(&header, &items, &item_hdrs);
+    assert_eq!(storage.len(), 10);
 }
 
 #[test]
