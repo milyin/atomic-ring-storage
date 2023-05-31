@@ -5,77 +5,52 @@ use std::{
 
 #[repr(C)]
 pub struct Lock {
-    // refcount == -1 means write lock, no operation is allowed
-    // refcount == 0 means protected data is empty, only 'create' operation is allowed
-    // refcount == 1 means protected data exists and not in use, 'update' and 'read' operations are allowed
-    // refcount > 1 means protected data exists and is being read, only 'read' operation is allowed
-    refcount: AtomicI32,
+    // -1 means write lock, no operation is allowed
+    // 0 means no locks, any operation is allowed
+    // > 1 means numeber of read locks, only read operations are allowed
+    rwlock: AtomicI32,
 }
 
 impl Default for Lock {
     fn default() -> Self {
         Self {
-            refcount: AtomicI32::new(0),
+            rwlock: AtomicI32::new(0),
         }
     }
 }
 
 impl Lock {
-    // Tries to acquire a write lock on empty data (refcount == 0).
-    // If data is not empty (refcount > 0) or another writer is active (refcount == -1), returns None.
-    // If data is empty (refcount == 0):
-    // - acquires the write lock (set refcount to -1)
-    // - calls write function f
-    //   - sets reference count to 1 if f returns Some
-    //   - sets reference count to 0 if f returns None
-    // - returns f's result.
-    pub fn create<R>(&self, f: impl FnOnce() -> Option<R>) -> Option<R> {
+    // Tries to acquire a write lock
+    // If data is being read or written (rwlock != 0), returns None.
+    // IF data is not being read or written (rwlock = 0):
+    // - acquires the write lock (set rwlock to -1)
+    // - calls update function f
+    // - releases the lock (set rwlock to 0)
+    // - returns Some of f's result.
+    pub fn write<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
         if self
-            .refcount
+            .rwlock
             .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
             let r = f();
-            self.refcount
-                .store(if r.is_some() { 1 } else { 0 }, Ordering::Release);
-            r
+            self.rwlock.store(0, Ordering::Release);
+            Some(r)
         } else {
             None
         }
     }
-    // Tries to acquire a write lock on non-empty data (refcount == 1).
-    // If data is empty (refcount == 0) or another writer is active (refcount == -1), or data is being read (refcount > 1) returns None.
-    // IF data is not empty and not being read (refcount == 1):
-    // - acquires the write lock (set refcount to -1)
-    // - calls update function f
-    //   - sets reference count to 1 if f returns Some
-    //   - sets reference count to 0 if f returns None
-    // - returns f's result.
-    pub fn update<R>(&self, f: impl FnOnce() -> Option<R>) -> Option<R> {
-        if self
-            .refcount
-            .compare_exchange_weak(1, -1, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            let r = f();
-            self.refcount
-                .store(if r.is_some() { 1 } else { 0 }, Ordering::Release);
-            r
-        } else {
-            None
-        }
-    }
-    // Tries to acquire a read lock on non-empty data (refcount > 0).
-    // If writer is active (refcount == -1) or there is no data (refcount == 0), returns None.
-    // Otherwise increments reference count, calls read function f, decrements reference count and returns Some with f's result.
+    // Tries to acquire a read lock
+    // If writer is active (rwlock == -1), returns None.
+    // Otherwise increments rwlock count, calls read function f, decrements rwlock and returns Some with f's result.
     pub fn read<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
         if self
-            .refcount
+            .rwlock
             .fetch_update(Ordering::Acquire, Ordering::Relaxed, |x| {
-                if x > 0 {
-                    Some(x + 1)
-                } else {
+                if x < 0 {
                     None
+                } else {
+                    Some(x + 1)
                 }
             })
             .is_err()
@@ -83,7 +58,7 @@ impl Lock {
             return None;
         }
         let r = f();
-        self.refcount.fetch_sub(1, Ordering::Release);
+        self.rwlock.fetch_sub(1, Ordering::Release);
         Some(r)
     }
 }
@@ -106,16 +81,16 @@ impl StorageHdr {
 #[repr(C)]
 pub struct ItemHdr {
     lock: Lock,
-    refcount: AtomicU32,
-    id: usize,
+    refcount: AtomicI32,
+    id: AtomicUsize,
 }
 
 impl Default for ItemHdr {
     fn default() -> Self {
         Self {
             lock: Lock::default(),
-            refcount: AtomicU32::new(0),
-            id: 0,
+            refcount: AtomicI32::new(0),
+            id: AtomicUsize::new(0),
         }
     }
 }
@@ -155,13 +130,17 @@ impl<'a, T> Storage<'a, T> {
             let id = self.header.next_id.fetch_add(1, Ordering::Relaxed);
             let pos = id % self.header.size;
             let hdr = &self.item_hdrs[pos];
-            if let Some(item) = hdr
-                .lock
-                .create(|| Some(unsafe { &mut *self.items[pos].get() }))
-            {
-                // Token is not given to anyone yet so it's safe to access the data outside of the write lock
-                f(item);
-                return Some(Token { id });
+            // If item is referenced by someone else, skip it
+            // Negative refcount is not normally expected, but possible if someone decremented refcount too much
+            if hdr.refcount.load(Ordering::Acquire) <= 0 {
+                // Item is free, but it still might be read or write locked by someone else
+                if let Some(item) = hdr.lock.write(|| unsafe { &mut *self.items[pos].get() }) {
+                    // Token is not given to anyone yet so it's safe to access the data outside of the write lock
+                    f(item);
+                    hdr.refcount.store(1, Ordering::Relaxed);
+                    hdr.id.store(id, Ordering::Release);
+                    return Some(Token { id });
+                }
             }
         }
         // no free slots found
@@ -171,14 +150,27 @@ impl<'a, T> Storage<'a, T> {
     pub fn get<R>(&self, token: Token, f: impl FnOnce(&T) -> R) -> Option<R> {
         let pos = token.id % self.header.size;
         let hdr = &self.item_hdrs[pos];
+        let id = hdr.id.load(Ordering::Acquire);
+        if token.id != id {
+            return None;
+        }
+        hdr.lock.read(|| f(unsafe { &*self.items[pos].get() }))
+    }
+
+    pub fn incref(&self, token: Token) -> Option<i32> {
+        let pos = token.id % self.header.size;
+        let hdr = &self.item_hdrs[pos];
+        let id = hdr.id.load(Ordering::Acquire);
         hdr.lock
-            .read(|| {
-                if hdr.id != token.id {
-                    return None;
-                }
-                Some(f(unsafe { &*self.items[pos].get() }))
-            })
-            .flatten()
+            .read(|| hdr.refcount.fetch_add(1, Ordering::Release) + 1)
+    }
+
+    pub fn decref(&self, token: Token) -> Option<i32> {
+        let pos = token.id % self.header.size;
+        let hdr = &self.item_hdrs[pos];
+        let id = hdr.id.load(Ordering::Acquire);
+        hdr.lock
+            .read(|| hdr.refcount.fetch_sub(1, Ordering::Release) - 1)
     }
 }
 
@@ -194,36 +186,18 @@ fn test_init_storage() {
 #[test]
 fn test_lock_api() {
     let lock = Lock::default();
-    assert_eq!(lock.refcount.load(Ordering::Relaxed), 0);
-    assert_eq!(lock.create(|| Some(1)), Some(1));
-    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
-    assert_eq!(lock.create(|| Some(2)), None);
-    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
-    assert_eq!(lock.update(|| Some(3)), Some(3));
-    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
-    assert_eq!(lock.update(|| Option::<()>::None), None);
-    assert_eq!(lock.refcount.load(Ordering::Relaxed), 0);
-
+    assert_eq!(lock.rwlock.load(Ordering::Relaxed), 0);
     assert_eq!(
-        lock.create(|| {
-            assert_eq!(lock.refcount.load(Ordering::Relaxed), -1);
-            Some(4)
+        lock.write(|| {
+            assert_eq!(lock.rwlock.load(Ordering::Relaxed), -1);
         }),
-        Some(4)
+        Some(())
     );
     assert_eq!(
         lock.read(|| {
-            assert_eq!(lock.refcount.load(Ordering::Relaxed), 2);
-            5
+            assert_eq!(lock.rwlock.load(Ordering::Relaxed), 1);
         }),
-        Some(5)
+        Some(())
     );
-    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        lock.update(|| {
-            assert_eq!(lock.refcount.load(Ordering::Relaxed), -1);
-            Option::<()>::None
-        }),
-        None
-    );
+    assert_eq!(lock.rwlock.load(Ordering::Relaxed), 0);
 }
