@@ -103,9 +103,46 @@ impl<'a, T> Storage<'a, T> {
 }
 
 #[test]
-fn test() {
+fn test_init_storage() {
     let mut data = [0; 10];
     let mut locks = [(); 10].map(|_| Lock::default());
     let storage = Storage::new(&mut data, &mut locks);
     assert_eq!(storage.size, 10);
+}
+
+#[test]
+fn test_lock_api() {
+    let lock = Lock::default();
+    assert_eq!(lock.refcount.load(Ordering::Relaxed), 0);
+    assert_eq!(lock.create(|| Some(1)), Some(1));
+    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
+    assert_eq!(lock.create(|| Some(2)), None);
+    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
+    assert_eq!(lock.update(|| Some(3)), Some(3));
+    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
+    assert_eq!(lock.update(|| Option::<()>::None), None);
+    assert_eq!(lock.refcount.load(Ordering::Relaxed), 0);
+
+    assert_eq!(
+        lock.create(|| {
+            assert_eq!(lock.refcount.load(Ordering::Relaxed), -1);
+            Some(4)
+        }),
+        Some(4)
+    );
+    assert_eq!(
+        lock.read(|| {
+            assert_eq!(lock.refcount.load(Ordering::Relaxed), 2);
+            5
+        }),
+        Some(5)
+    );
+    assert_eq!(lock.refcount.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        lock.update(|| {
+            assert_eq!(lock.refcount.load(Ordering::Relaxed), -1);
+            Option::<()>::None
+        }),
+        None
+    );
 }
